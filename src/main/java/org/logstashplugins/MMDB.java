@@ -44,6 +44,7 @@ public class MMDB implements Filter {
 
     private final static AtomicReference<Reader> readerRef = new AtomicReference<>();
     private static WatchService watchService;
+    public static long lastModifiedTime = 0L;
 
     private String id;
     private String sourceField;
@@ -54,26 +55,7 @@ public class MMDB implements Filter {
 
     private NodeCache cache;
 
-    private static final Pattern FIELD_PATTERN = Pattern.compile("(?<before>\\w+(\\.\\w+)?)(\\s*:\\s*(?<after>\\w+))?");
-
-    public static void main(String[] args) {
-        Matcher matcher = FIELD_PATTERN.matcher("aa");
-        matcher.matches();
-        System.out.println(matcher.group("before"));
-        System.out.println(matcher.group("after"));
-        matcher = FIELD_PATTERN.matcher("aa:dd");
-        matcher.matches();
-        System.out.println(matcher.group("before"));
-        System.out.println(matcher.group("after"));
-        matcher = FIELD_PATTERN.matcher("a.b");
-        matcher.matches();
-        System.out.println(matcher.group("before"));
-        System.out.println(matcher.group("after"));
-        matcher = FIELD_PATTERN.matcher("a.b:c");
-        matcher.matches();
-        System.out.println(matcher.group("before"));
-        System.out.println(matcher.group("after"));
-    }
+    private static final Pattern FIELD_PATTERN = Pattern.compile("(?<before>\\w+(\\.\\w+)*)(\\s*:\\s*(?<after>\\w+))?");
 
     public MMDB(String id, Configuration config, Context context) {
         // constructors should validate configuration options
@@ -121,7 +103,7 @@ public class MMDB implements Filter {
                         continue;
                     }
                 }
-                throw new IllegalStateException("Fields config must only be a list of strings:" + FIELD_PATTERN);
+                throw new IllegalStateException("Fields config must only be a list of strings");
             }
         }
 
@@ -137,28 +119,42 @@ public class MMDB implements Filter {
         try {
             Reader databaseReader = new Reader(databaseFile, cache);
             readerRef.set(databaseReader);
-            ScheduledExecutorService watchExecutor = Executors.newSingleThreadScheduledExecutor();
             watchService = FileSystems.getDefault().newWatchService();
-            Path path = databaseFile.toPath();
-            path.register(watchService, StandardWatchEventKinds.ENTRY_MODIFY);
-            watchExecutor.schedule(() -> {
-                try {
-                    WatchKey watchKey = watchService.poll();
-                    if (watchKey != null) {
-                        List<WatchEvent<?>> events = watchKey.pollEvents();
-                        if (events != null && !events.isEmpty()) {
-                            Reader reader = new Reader(databaseFile, cache);
-                            readerRef.set(reader);
-                            context.getLogger(MMDB.this).info("mmdb reload:" + reader.getMetadata().toString());
+            Path filePath = databaseFile.toPath();
+            filePath.getParent().register(watchService, StandardWatchEventKinds.ENTRY_MODIFY);
+            Executors.newSingleThreadExecutor().execute(() -> {
+                while (true) {
+                    try {
+                        WatchKey watchKey = watchService.take();
+                        if (watchKey != null) {
+                            List<WatchEvent<?>> events = watchKey.pollEvents();
+                            for (WatchEvent<?> event : events) {
+                                if (event.kind() == StandardWatchEventKinds.OVERFLOW ||
+                                    ((WatchEvent<Path>) event).context().equals(filePath.getFileName())) {
+                                    try {
+                                        Reader reader = new Reader(databaseFile, cache);
+                                        readerRef.set(reader);
+                                        lastModifiedTime = System.currentTimeMillis();
+                                        context.getLogger(MMDB.this).info("mmdb reload:" + reader.getMetadata().toString());
+                                    } catch (Exception ex) {
+                                        context.getLogger(MMDB.this).error("mmdb reload failed", ex);
+                                    }
+                                }
+                            }
+                            boolean valid = watchKey.reset();
+                            if (!valid) {
+                                break;
+                            }
                         }
-                        watchKey.reset();
+                    } catch (InterruptedException e) {
+                        return;
+                    } catch (Throwable e) {
+                        context.getLogger(MMDB.this).error("mmdb watch error", e);
                     }
-                } catch (Throwable e) {
-                    context.getLogger(MMDB.this).error("mmdb watch error", e);
                 }
-            }, 60, TimeUnit.SECONDS);
+            });
         } catch (java.io.IOException ex) {
-            throw new IllegalStateException("Database does not appear to be a valid database");
+            throw new IllegalStateException("Database does not appear to be a valid database", ex);
         }
         context.getLogger(this).info(readerRef.get().getMetadata().toString());
     }
