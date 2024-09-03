@@ -25,6 +25,13 @@ This unlocks the aggregate on really-useful criteria:
 You, as the MMDB database creator, are in total control of what goes into the
 MMDB and which fields you want to extract inside of Logstash.
 
+## install plugin
+
+1. download `logstash-filter-mmdb-2.0.0.gem` from [Release](https://github.com/Aliang-code/logstash-filter-mmdb/releases)
+2. exec `bin/logstash-plugin install path/to/logstash-filter-mmdb-2.0.0.gem`
+
+> **NOTE**  require logstash-filter-geoip 7.3.0+ to use same mmdb version
+
 ## Sample Configuration
 
 A useful Logstash filter configuration would look something like the following:
@@ -35,7 +42,8 @@ filter {
         source => "ip"
         target => "ipinfo"
         database => "/path/to/demo.mmdb"
-        fields => ["subnet", "name", "vlan_id"]
+        #support nested map and convert field name
+        fields => ["subnet", "name", "vlan_id", "country.name:country_name"]
     }
 }
 ```
@@ -53,20 +61,27 @@ for that looked like the following:
         "types": {
             "vlan_id": "uint32",
             "name": "utf8_string",
-            "campus": "utf8_string"
+            "campus": "utf8_string",
+            "country": "map"
         }
     },
     "allocations": [
         {
             "subnet": "10.10.0.0/16",   <--- REQUIRED FIELD
             "name": "Datacenter range",
-            "campus": "Head Office"
+            "campus": "Head Office",
+            "country": {
+               "name": "US"
+             }
         },
         {
             "subnet": "10.10.0.0/20",
             "vlan_id": 1,
             "name": "Management interfaces",
-            "campus": "Head Office"
+            "campus": "Head Office",
+            "country": {
+               "name": "US"
+             }
         },
         ...
 ```
@@ -88,8 +103,15 @@ Then an event such as the following (expressed as JSON)...
     "ipinfo": {
         "name": "Management interfaces",
         "vlan_id": 1,
-        "subnet": "10.10.0.0/20"
+        "subnet": "10.10.0.0/20",
+        "country_name": "US"
     },
     "message":"configuration changed"
 }
 ```
+
+## build new version
+
+recomment to use docker:
+`sh build.sh`
+

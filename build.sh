@@ -1,7 +1,7 @@
 #!/bin/bash
 
 echo LOGSTASH_CORE_PATH=/src/logstash/logstash-core > ./gradle.properties
-docker run --rm -it -v $PWD:/work cameronkerrnz/logstash-plugin-dev:7.17 \
+docker run --user 0:0 --rm -it -v $PWD:/work cameronkerrnz/logstash-plugin-dev:7.17 \
   -c "
     chmod +x ./gradlew \
     && ./gradlew assemble \

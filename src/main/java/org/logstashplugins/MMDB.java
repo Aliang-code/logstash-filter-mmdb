@@ -9,16 +9,10 @@ import co.elastic.logstash.api.LogstashPlugin;
 import co.elastic.logstash.api.PluginConfigSpec;
 import co.elastic.logstash.api.PluginHelper;
 
-import java.util.Arrays;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.List;
+import java.nio.file.*;
+import java.util.*;
 
 import com.maxmind.db.Reader;
-import com.maxmind.db.DatabaseRecord;
 import com.maxmind.db.Metadata;
 import com.maxmind.db.CHMCache;
 import com.maxmind.db.NoCache;
@@ -27,31 +21,59 @@ import com.maxmind.db.NodeCache;
 import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 // class name must match plugin name
 @LogstashPlugin(name = "mmdb")
 public class MMDB implements Filter {
 
     public static final PluginConfigSpec<String> SOURCE_CONFIG =
-            PluginConfigSpec.requiredStringSetting("source");
+        PluginConfigSpec.requiredStringSetting("source");
     public static final PluginConfigSpec<String> TARGET_CONFIG =
-            PluginConfigSpec.requiredStringSetting("target");
+        PluginConfigSpec.requiredStringSetting("target");
     public static final PluginConfigSpec<String> DATABASE_FILENAME_CONFIG =
-            PluginConfigSpec.requiredStringSetting("database");
+        PluginConfigSpec.requiredStringSetting("database");
     public static final PluginConfigSpec<Long> CACHE_SIZE_CONFIG =
-            PluginConfigSpec.numSetting("cache_size", 0L);
+        PluginConfigSpec.numSetting("cache_size", 0L);
     public static final PluginConfigSpec<List<Object>> FIELDS_CONFIG =
-            PluginConfigSpec.arraySetting("fields");
-    
+        PluginConfigSpec.arraySetting("fields");
+
+
+    private final static AtomicReference<Reader> readerRef = new AtomicReference<>();
+    private static WatchService watchService;
+
     private String id;
     private String sourceField;
     private String targetField;
-    private Reader databaseReader;
     private String databaseFilename;
     private String failureTag = "_mmdb_lookup_failure";
-    private List<String> fields;
+    private Map<String, FieldNode> fieldNodeMap;
 
     private NodeCache cache;
+
+    private static final Pattern FIELD_PATTERN = Pattern.compile("(?<before>\\w+(\\.\\w+)?)(\\s*:\\s*(?<after>\\w+))?");
+
+    public static void main(String[] args) {
+        Matcher matcher = FIELD_PATTERN.matcher("aa");
+        matcher.matches();
+        System.out.println(matcher.group("before"));
+        System.out.println(matcher.group("after"));
+        matcher = FIELD_PATTERN.matcher("aa:dd");
+        matcher.matches();
+        System.out.println(matcher.group("before"));
+        System.out.println(matcher.group("after"));
+        matcher = FIELD_PATTERN.matcher("a.b");
+        matcher.matches();
+        System.out.println(matcher.group("before"));
+        System.out.println(matcher.group("after"));
+        matcher = FIELD_PATTERN.matcher("a.b:c");
+        matcher.matches();
+        System.out.println(matcher.group("before"));
+        System.out.println(matcher.group("after"));
+    }
 
     public MMDB(String id, Configuration config, Context context) {
         // constructors should validate configuration options
@@ -59,12 +81,12 @@ public class MMDB implements Filter {
         this.sourceField = config.get(SOURCE_CONFIG);
         this.targetField = config.get(TARGET_CONFIG);
         this.databaseFilename = config.get(DATABASE_FILENAME_CONFIG);
-        this.fields = null; // null = all fields to be exported
+        this.fieldNodeMap = null; // null = all fields to be exported
 
         if (this.databaseFilename == null) {
             throw new IllegalStateException("Must specify database filename");
         }
-        
+
         if (this.sourceField == null) {
             throw new IllegalStateException("Must specify source field");
         }
@@ -75,13 +97,31 @@ public class MMDB implements Filter {
 
         List<Object> fieldsTmp = config.get(FIELDS_CONFIG);
         if (fieldsTmp != null) {
-            this.fields = new ArrayList<String>();
+            this.fieldNodeMap = new HashMap<>();
             for (Object o : fieldsTmp) {
                 if (o instanceof String) {
-                    this.fields.add( (String) o );
-                } else {
-                    throw new IllegalStateException("Fields config must only be a list of strings");
+                    Matcher matcher;
+                    if ((matcher = FIELD_PATTERN.matcher((String) o)).matches()) {
+                        String before = matcher.group("before");
+                        String after_tmp = matcher.group("after");
+                        String after = after_tmp == null || after_tmp.isEmpty() ? before : after_tmp;
+                        //split every nested filed like ["a","a.b.c:bb","e.f:dd"]
+                        String[] fs = before.split("\\.");
+                        Map<String, FieldNode> fieldNodeMap = this.fieldNodeMap;
+                        for (int i = 0; i < fs.length; i++) {
+                            FieldNode node = fieldNodeMap.get(fs[i]);
+                            if (node == null) {
+                                node = new FieldNode(fs[i], i == fs.length - 1 ? after : null);
+                                fieldNodeMap.put(fs[i], node);
+                            } else if (i == fs.length - 1) {
+                                node.setTarget(after);
+                            }
+                            fieldNodeMap = fieldNodeMap.get(fs[i]).getChildMap();
+                        }
+                        continue;
+                    }
                 }
+                throw new IllegalStateException("Fields config must only be a list of strings:" + FIELD_PATTERN);
             }
         }
 
@@ -95,58 +135,87 @@ public class MMDB implements Filter {
 
         File databaseFile = new File(this.databaseFilename);
         try {
-            this.databaseReader = new Reader(databaseFile, cache);
+            Reader databaseReader = new Reader(databaseFile, cache);
+            readerRef.set(databaseReader);
+            ScheduledExecutorService watchExecutor = Executors.newSingleThreadScheduledExecutor();
+            watchService = FileSystems.getDefault().newWatchService();
+            Path path = databaseFile.toPath();
+            path.register(watchService, StandardWatchEventKinds.ENTRY_MODIFY);
+            watchExecutor.schedule(() -> {
+                try {
+                    WatchKey watchKey = watchService.poll();
+                    if (watchKey != null) {
+                        List<WatchEvent<?>> events = watchKey.pollEvents();
+                        if (events != null && !events.isEmpty()) {
+                            Reader reader = new Reader(databaseFile, cache);
+                            readerRef.set(reader);
+                            context.getLogger(MMDB.this).info("mmdb reload:" + reader.getMetadata().toString());
+                        }
+                        watchKey.reset();
+                    }
+                } catch (Throwable e) {
+                    context.getLogger(MMDB.this).error("mmdb watch error", e);
+                }
+            }, 60, TimeUnit.SECONDS);
         } catch (java.io.IOException ex) {
             throw new IllegalStateException("Database does not appear to be a valid database");
         }
-
-        context.getLogger(this).info(databaseReader.getMetadata().toString());
+        context.getLogger(this).info(readerRef.get().getMetadata().toString());
     }
 
     public Metadata getMetadata() {
-        if (null == this.databaseReader) {
+        if (null == readerRef.get()) {
             return null;
         }
-        return this.databaseReader.getMetadata();
+        return readerRef.get().getMetadata();
     }
 
     // This assumes that the fields in the MMDB are a flat structure
-    // AND only contain either numbers or strings
-    //
-    private void renderMapIntoEvent(
-        Map<String, Object> fields,
-        Event e
-    ) {
-        for (Map.Entry<String, Object> field : fields.entrySet()) {
-
-            if (this.fields != null) {
-                if (! this.fields.contains(field.getKey())) {
-                    continue;
+    private void renderMapIntoEvent(Map<String, FieldNode> fieldNodeMap,
+                                    Map<String, Object> data,
+                                    Event e) {
+        if (fieldNodeMap != null && !fieldNodeMap.isEmpty()) {
+            //support nested map
+            for (Map.Entry<String, FieldNode> entry : fieldNodeMap.entrySet()) {
+                FieldNode fieldNode = entry.getValue();
+                Object value = data.get(fieldNode.getName());
+                if (value != null) {
+                    if (fieldNode.getTarget() != null) {
+                        setField(e, fieldNode.getTarget(), value);
+                    }
+                    if (fieldNode.getChildMap() != null && !fieldNode.getChildMap().isEmpty()
+                        && value instanceof Map) {
+                        renderMapIntoEvent(fieldNode.getChildMap(), (Map<String, Object>) value, e);
+                    }
                 }
             }
+        } else {
+            for (Map.Entry<String, Object> field : data.entrySet()) {
+                setField(e, field.getKey(), field.getValue());
+            }
+        }
+    }
 
-            String key = "[" + this.targetField + "][" + field.getKey() + "]";
+    private void setField(Event e, String key, Object value) {
+        key = "[" + this.targetField + "][" + key + "]";
+        if (value instanceof String) {
+            e.setField(key, value);
+        } else if (value instanceof Long) {
+            e.setField(key, value);
+        } else if (value instanceof Float) {
+            e.setField(key, value);
+        } else if (value instanceof Boolean) {
+            e.setField(key, value);
+        }
+        //support nested map or list
+        else if (value instanceof Map
+            || value instanceof List) {
+            e.setField(key, value);
+        }
 
-            if (field.getValue() instanceof String) {
-                e.setField(key, (String) field.getValue());
-            }
-            
-            else if (field.getValue() instanceof Long) {
-                e.setField(key, (Long) field.getValue());
-            }
-            
-            else if (field.getValue() instanceof Float) {
-                e.setField(key, (Float) field.getValue());
-            }
-
-            else if (field.getValue() instanceof Boolean) {
-                e.setField(key, (Boolean) field.getValue());
-            }
-
-            // FIXME: Should we support lists and objects?
-            else {
-                e.tag(this.failureTag);
-            }
+        // FIXME: Should we support lists and objects?
+        else {
+            e.tag(this.failureTag);
         }
     }
 
@@ -155,7 +224,7 @@ public class MMDB implements Filter {
         for (Event e : events) {
             try {
                 @SuppressWarnings("unchecked")
-                Map<String,Object> recordData = this.databaseReader.get(
+                Map<String, Object> recordData = readerRef.get().get(
                     InetAddress.getByName(
                         e.getField(this.sourceField).toString()),
                     Map.class);
@@ -165,7 +234,7 @@ public class MMDB implements Filter {
                     continue;
                 }
 
-                renderMapIntoEvent(recordData, e);
+                renderMapIntoEvent(this.fieldNodeMap, recordData, e);
 
                 matchListener.filterMatched(e);
 
@@ -182,7 +251,7 @@ public class MMDB implements Filter {
 
     @Override
     public Collection<PluginConfigSpec<?>> configSchema() {
-        
+
         // The Java example I was looking at doesn't tell
         // you that you need to include the common config
         // too, nor does it show how.

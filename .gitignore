@@ -13,8 +13,5 @@ out/
 *.class
 *.ipr
 *.iws
-*.gem
-*.gemspec
-Gemfile*
 settings.gradle
 gradle.properties
