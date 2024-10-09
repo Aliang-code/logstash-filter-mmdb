@@ -1,27 +1,17 @@
 package org.logstashplugins;
 
-import co.elastic.logstash.api.Configuration;
-import co.elastic.logstash.api.Context;
-import co.elastic.logstash.api.Event;
-import co.elastic.logstash.api.Filter;
-import co.elastic.logstash.api.FilterMatchListener;
-import co.elastic.logstash.api.LogstashPlugin;
-import co.elastic.logstash.api.PluginConfigSpec;
-import co.elastic.logstash.api.PluginHelper;
-
-import java.nio.file.*;
-import java.util.*;
-
-import com.maxmind.db.Reader;
-import com.maxmind.db.Metadata;
+import co.elastic.logstash.api.*;
 import com.maxmind.db.CHMCache;
+import com.maxmind.db.Metadata;
 import com.maxmind.db.NoCache;
-import com.maxmind.db.NodeCache;
+import com.maxmind.db.Reader;
 
 import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
-import java.util.concurrent.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -52,8 +42,7 @@ public class MMDB implements Filter {
     private String databaseFilename;
     private String failureTag = "_mmdb_lookup_failure";
     private Map<String, FieldNode> fieldNodeMap;
-
-    private NodeCache cache;
+    private int cacheSize = 0;
 
     private static final Pattern FIELD_PATTERN = Pattern.compile("(?<before>\\w+(\\.\\w+)*)(\\s*:\\s*(?<after>\\w+))?");
 
@@ -107,17 +96,11 @@ public class MMDB implements Filter {
             }
         }
 
-        if (config.get(CACHE_SIZE_CONFIG) > 0L) {
-            this.cache = new CHMCache(config.get(CACHE_SIZE_CONFIG).intValue());
-        } else if (config.get(CACHE_SIZE_CONFIG) == 0L) {
-            this.cache = NoCache.getInstance();
-        } else {
-            throw new IllegalStateException("Cache size must be either >0 to use a cache, or =0 to use no cache");
-        }
+        this.cacheSize = config.get(CACHE_SIZE_CONFIG).intValue();
 
         File databaseFile = new File(this.databaseFilename);
         try {
-            Reader databaseReader = new Reader(databaseFile, cache);
+            Reader databaseReader = new Reader(databaseFile, cacheSize > 0 ? new CHMCache(cacheSize) : NoCache.getInstance());
             readerRef.set(databaseReader);
             watchService = FileSystems.getDefault().newWatchService();
             Path filePath = databaseFile.toPath();
@@ -132,8 +115,10 @@ public class MMDB implements Filter {
                                 if (event.kind() == StandardWatchEventKinds.OVERFLOW ||
                                     ((WatchEvent<Path>) event).context().equals(filePath.getFileName())) {
                                     try {
-                                        Reader reader = new Reader(databaseFile, cache);
+                                        Reader old = readerRef.get();
+                                        Reader reader = new Reader(databaseFile, cacheSize > 0 ? new CHMCache(cacheSize) : NoCache.getInstance());
                                         readerRef.set(reader);
+                                        old.close();
                                         lastModifiedTime = System.currentTimeMillis();
                                         context.getLogger(MMDB.this).info("mmdb reload:" + reader.getMetadata().toString());
                                     } catch (Exception ex) {
