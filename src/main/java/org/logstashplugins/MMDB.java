@@ -97,6 +97,9 @@ public class MMDB implements Filter {
         }
 
         this.cacheSize = config.get(CACHE_SIZE_CONFIG).intValue();
+        if(this.cacheSize < 0) {
+            throw new IllegalStateException("Cache size must be either >0 to use a cache, or =0 to use no cache");
+        }
 
         File databaseFile = new File(this.databaseFilename);
         try {
